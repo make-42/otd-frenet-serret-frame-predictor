@@ -1,0 +1,36 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = ".modules", ".modules", "{B5EC2E5C-5159-4FF9-9217-1C7292D6728A}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "OpenTabletDriver", "OpenTabletDriver", "{7FC636B6-FAA9-4FC4-8E42-9836C7DB9510}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OpenTabletDriver.Plugin", ".modules\OpenTabletDriver\OpenTabletDriver.Plugin\OpenTabletDriver.Plugin.csproj", "{B53481EF-D037-477C-A444-02956FE8D8C8}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FrenetSerretFramePredictor", "FrenetSerretFramePredictor\FrenetSerretFramePredictor.csproj", "{D1D5961F-2B9E-4D07-B721-0567D8C1B7F1}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B53481EF-D037-477C-A444-02956FE8D8C8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B53481EF-D037-477C-A444-02956FE8D8C8}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B53481EF-D037-477C-A444-02956FE8D8C8}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B53481EF-D037-477C-A444-02956FE8D8C8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D1D5961F-2B9E-4D07-B721-0567D8C1B7F1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D1D5961F-2B9E-4D07-B721-0567D8C1B7F1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D1D5961F-2B9E-4D07-B721-0567D8C1B7F1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D1D5961F-2B9E-4D07-B721-0567D8C1B7F1}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{7FC636B6-FAA9-4FC4-8E42-9836C7DB9510} = {B5EC2E5C-5159-4FF9-9217-1C7292D6728A}
+		{B53481EF-D037-477C-A444-02956FE8D8C8} = {7FC636B6-FAA9-4FC4-8E42-9836C7DB9510}
+	EndGlobalSection
+EndGlobal
