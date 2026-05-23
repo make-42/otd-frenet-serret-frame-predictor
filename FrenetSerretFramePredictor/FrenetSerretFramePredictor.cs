@@ -63,33 +63,67 @@ namespace FrenetSerretFramePredictor
         ToolTip("How often the tablet sends reports")]
         public float TabFreq { get; set; } = 133f;
 
+        [SliderProperty("Spline Points Per Sample", 1f, 8f, 1f),
+        DefaultPropertyValue(1),
+        ToolTip("Number of spline interpolation points between each tablet sample. (Tune carefully as lots of spline points could cause the time step to be too small and therefore amplify any floating point arithmetic errors)")]
+        public int SplinePointsPerSample
+        {
+            get => splinePointsPerSample;
+            set
+            {
+                splinePointsPerSample = value;
+                _splineBaseFunction = Array.Empty<float>(); // force reinit
+                lock (_historyLock) { _historyDirty = true; }
+            }
+        }
+
+        [SliderProperty("Integration Steps", 1f, 100f, 10f),
+        DefaultPropertyValue(10),
+        ToolTip("Number of steps used to integrate the predicted path. Higher = more accurate prediction, more CPU. (Same comment as spline points per sample)")]
+        public int IntegrationSteps
+        {
+            get => integrationsteps;
+            set => integrationsteps = value;
+        }
+
         private readonly record struct Sample(float X, float Y, double Tick);
+
         private readonly List<Sample> _history = new();
+        private bool _historyDirty = true;
+        private readonly List<Sample> _historySnapshot = new();
+        private readonly object _historyLock = new();
 
         private ITabletReport? _tablet;
         private Vector2 _lastRawPosition;
         private Vector2 _lastPredictedPosition;
         private Vector2 _lastForcedPosition;
 
-        private float[] dxArr = Array.Empty<float>();
-        private float[] dyArr = Array.Empty<float>();
-        private float[] ndx = Array.Empty<float>();
-        private float[] ndy = Array.Empty<float>();
-        private float[] vel = Array.Empty<float>();
-        private float[] nvel = Array.Empty<float>();
-        private float[] normalaccel = Array.Empty<float>();
-        private float[] nnormalaccel = Array.Empty<float>();
-
         private int splinePointsPerSample = 1;
-        private float[] splineBaseFunction = Array.Empty<float>();
+        private float[] _splineBaseFunction = Array.Empty<float>();
         private int bsplineOrder = 3;
 
         private long _lastTick;
-        private long tabletReports;
+        private long _tabletReports;
         private readonly Stopwatch _clock = Stopwatch.StartNew();
 
-        private float[] velorders = new float[5];
-        private float[] normalaccelorders = new float[5];
+        // Cached computations
+        private float[] _sx = Array.Empty<float>();
+        private float[] _sy = Array.Empty<float>();
+        private float[] _vx = Array.Empty<float>();
+        private float[] _vy = Array.Empty<float>();
+        private float[] _towerA_X = Array.Empty<float>();
+        private float[] _towerA_Y = Array.Empty<float>();
+        private float[] _towerB_X = Array.Empty<float>();
+        private float[] _towerB_Y = Array.Empty<float>();
+        private float[] _nextNa_A = Array.Empty<float>();
+        private float[] _nextNa_B = Array.Empty<float>();
+        private float[] _velDx = new float[5];
+        private float[] _velDy = new float[5];
+        private float[] _na = Array.Empty<float>();
+        private float[] _naDx = new float[5];
+        private float _baseNA;
+        private float _wvx, _wvy;
+        private float[] _strengths = new float[5];
 
         private int integrationsteps = 30;
 
@@ -107,20 +141,24 @@ namespace FrenetSerretFramePredictor
                 long now = _clock.ElapsedTicks;
                 _lastTick = now;
 
-                tabletReports += 1;
+                _tabletReports += 1;
 
+                long cutoff =
+                    _tabletReports -
+                    (long)(CaptureWindowMs * TabFreq / 1000.0);
+
+                lock (_historyLock)
+                {
                 _lastRawPosition = tablet.Position;
-
+                
                 _history.Add(new Sample(
                     tablet.Position.X,
                     tablet.Position.Y,
-                    tabletReports
+                    _tabletReports
                 ));
-
-                long cutoff =
-                    tabletReports -
-                    (long)(CaptureWindowMs * TabFreq / 1000.0);
                 _history.RemoveAll(s => s.Tick < cutoff);
+                _historyDirty = true;
+                }
             }
         }
 
@@ -138,13 +176,19 @@ namespace FrenetSerretFramePredictor
 
             //Log.Write("FrenetSerretFramePredictor", $"dx={dx} dy={dy}", LogLevel.Info);
 
+            Vector2 rawPos;
+            lock (_historyLock)
+            {
+                rawPos = _lastRawPosition;
+            }
+
             _lastPredictedPosition = new Vector2(
-                _lastRawPosition.X + dx,
-                _lastRawPosition.Y + dy
+                rawPos.X + dx,
+                rawPos.Y + dy
             );
 
             _lastForcedPosition = new Vector2(_lastForcedPosition.X+Rigidity*(_lastPredictedPosition.X-_lastForcedPosition.X),_lastForcedPosition.Y+Rigidity*(_lastPredictedPosition.Y-_lastForcedPosition.Y));
-
+            
             _tablet.Position = _lastForcedPosition;
 
             OnEmit();
@@ -153,10 +197,10 @@ namespace FrenetSerretFramePredictor
         private void InitSpline()
         {
             int numPoints = splinePointsPerSample * bsplineOrder;
-            splineBaseFunction = new float[numPoints];
+            _splineBaseFunction = new float[numPoints];
             for (int i = 0; i < numPoints; i++)
             {
-                splineBaseFunction[i] = (float)BaseSpline(0, bsplineOrder, (double)i / splinePointsPerSample);
+                _splineBaseFunction[i] = (float)BaseSpline(0, bsplineOrder, (double)i / splinePointsPerSample);
             }
         }
 
@@ -169,164 +213,202 @@ namespace FrenetSerretFramePredictor
             return (t - i) / p * BaseSpline(i, p - 1, t) + (i + p + 1 - t) / p * BaseSpline(i + 1, p - 1, t);
         }
 
-
-        private (float dx, float dy) PredictDelta(double elapsedMs)
-{
-    int z = _history.Count;
-    if (z < 2) return (0f, 0f);
-
-    if (splineBaseFunction.Length == 0)
-        InitSpline();
-
-    float invdt = TabFreq * splinePointsPerSample;
-    int n = z * splinePointsPerSample;
-
-    // Evaluate spline into position arrays
-    var sx = new float[n];
-    var sy = new float[n];
-    for (int i = 0; i < n; i++)
-    {
-        sx[i] = _history[0].X;
-        sy[i] = _history[0].Y;
-        for (int j = 0; j < z; j++)
+        private static void EnsureSize(ref float[] arr, int size)
         {
-            int lo = j * splinePointsPerSample;
-            int hi = (j + bsplineOrder) * splinePointsPerSample;
-            if (i >= lo && i < hi)
+            if (arr.Length < size)
+                arr = new float[size];
+        }
+
+        private void RebuildCache()
+        {
+            _strengths[0] = D1Strength;
+            _strengths[1] = D2Strength;
+            _strengths[2] = D3Strength;
+            _strengths[3] = D4Strength;
+            _strengths[4] = D5Strength;
+
+            int z = _historySnapshot.Count;
+            if (z < 2) return;
+
+            if (_splineBaseFunction.Length == 0)
+                InitSpline();
+
+            float invdt = TabFreq * splinePointsPerSample;
+            int n = z * splinePointsPerSample;
+
+            // Evaluate spline into position arrays
+            EnsureSize(ref _sx, n);
+            EnsureSize(ref _sy, n);
+            for (int i = 0; i < n; i++)
             {
-                int idx = i - lo;
-                if (idx < splineBaseFunction.Length)
+                _sx[i] = _historySnapshot[0].X;
+                _sy[i] = _historySnapshot[0].Y;
+                for (int j = 0; j < z; j++)
                 {
-                    sx[i] += (_history[j].X - _history[0].X) * splineBaseFunction[idx];
-                    sy[i] += (_history[j].Y - _history[0].Y) * splineBaseFunction[idx];
+                    int lo = j * splinePointsPerSample;
+                    int hi = (j + bsplineOrder) * splinePointsPerSample;
+                    if (i >= lo && i < hi)
+                    {
+                        int idx = i - lo;
+                        if (idx < _splineBaseFunction.Length)
+                        {
+                            _sx[i] += (_historySnapshot[j].X - _historySnapshot[0].X) * _splineBaseFunction[idx];
+                            _sy[i] += (_historySnapshot[j].Y - _historySnapshot[0].Y) * _splineBaseFunction[idx];
+                        }
+                    }
                 }
             }
+
+            // First derivative of spline (velocity vectors)
+            int vLen = n - 1;
+            EnsureSize(ref _vx, vLen);
+            EnsureSize(ref _vy, vLen);
+            for (int i = 0; i < vLen; i++)
+            {
+                _vx[i] = (_sx[i + 1] - _sx[i]) * invdt;
+                _vy[i] = (_sy[i + 1] - _sy[i]) * invdt;
+            }
+
+            // Weighted average velocity at the trailing end (recent = higher weight)
+            _wvx = 0f;
+            _wvy = 0f;
+            float wvSum = 0f;
+
+            for (int i = 0; i < vLen; i++)
+            {
+                float w = i + 1f;
+                _wvx += _vx[i] * w;
+                _wvy += _vy[i] * w;
+                wvSum += w;
+            }
+            _wvx /= wvSum;
+            _wvy /= wvSum;
+
+            // Derivative tower: up to 5 orders of velocity vector derivatives
+            // _velDx[k], _velDy[k] = weighted average of (k+1)-th derivative of position
+            var curX = _vx;
+            var curY = _vy;
+            int curLen = vLen;
+
+            for (int order = 0; order < 5; order++)
+            {
+                int nextLen = curLen - 1;
+                if (nextLen <= 0) break;
+
+                ref float[] nextX = ref (order % 2 == 0 ? ref _towerA_X : ref _towerB_X);
+                ref float[] nextY = ref (order % 2 == 0 ? ref _towerA_Y : ref _towerB_Y);
+
+                EnsureSize(ref nextX, nextLen);
+                EnsureSize(ref nextY, nextLen);
+
+                for (int i = 0; i < nextLen; i++)
+                {
+                    nextX[i] = (curX[i + 1] - curX[i]) * invdt;
+                    nextY[i] = (curY[i + 1] - curY[i]) * invdt;
+                }
+
+                float wx = 0f, wy = 0f, ws = 0f;
+                for (int i = 0; i < nextLen; i++)
+                {
+                    float w = (i + 1f)*(i + 1f);
+                    wx += nextX[i] * w;
+                    wy += nextY[i] * w;
+                    ws += w;
+                }
+                if (ws > 0f)
+                {
+                    _velDx[order] = _strengths[order] * wx / ws;
+                    _velDy[order] = _strengths[order] * wy / ws;
+                }
+
+                curX = nextX;
+                curY = nextY;
+                curLen = nextLen;
+            }
+
+            // Normal acceleration (signed curvature × speed²) for turning
+            int naLen = n - 2;
+            if (naLen <= 0) return;
+            EnsureSize(ref _na, naLen);
+            for (int i = 0; i < naLen; i++)
+            {
+                float ax = _vx[i], ay = _vy[i];
+                float bx = _vx[i + 1], by = _vy[i + 1];
+                float na_ = ax * by - ay * bx; // cross product = signed curvature × speed²
+                float speed = MathF.Sqrt(ax * ax + ay * ay);
+                _na[i] = speed > 1e-6f ? na_ / speed : 0f; // normalise to angular velocity
+            }
+
+            float wna = 0f, wnaSum = 0f;
+            for (int i = 0; i < naLen; i++)
+            {
+                float w = (i + 1f)*(i + 1f);
+                wna += _na[i] * w;
+                wnaSum += w;
+            }
+            _baseNA = wnaSum > 0f ? wna / wnaSum : 0f;
+
+            // Derivative tower for normal acceleration
+            var curNa = _na;
+            int curNaLen = naLen;
+
+            for (int order = 0; order < 5; order++)
+            {
+                int nextLen = curNaLen - 1;
+                if (nextLen <= 0) break;
+
+
+                ref float[] nextNa = ref (order % 2 == 0 ? ref _nextNa_A : ref _nextNa_B);
+                EnsureSize(ref nextNa, nextLen);
+
+                for (int i = 0; i < nextLen; i++)
+                    nextNa[i] = (curNa[i + 1] - curNa[i]) * invdt;
+
+                float wn = 0f, ws = 0f;
+                for (int i = 0; i < nextLen; i++)
+                {
+                    float w = (i + 1f)*(i + 1f);
+                    wn += nextNa[i] * w;
+                    ws += w;
+                }
+                if (ws > 0f)
+                    _naDx[order] = _strengths[order] * wn / ws;
+
+                curNa = nextNa;
+                curNaLen = nextLen;
+            }
+
+            float naScale = Math.Clamp((float)(LookAheadMs / 50.0), 0f, 1f);
+            _baseNA *= naScale;
+            for (int i = 0; i < 5; i++) _naDx[i] *= naScale;
         }
-    }
 
-    // First derivative of spline (velocity vectors)
-    int vLen = n - 1;
-    var vx = new float[vLen];
-    var vy = new float[vLen];
-    for (int i = 0; i < vLen; i++)
-    {
-        vx[i] = (sx[i + 1] - sx[i]) * invdt;
-        vy[i] = (sy[i + 1] - sy[i]) * invdt;
-    }
 
-    // Weighted average velocity at the trailing end (recent = higher weight)
-    float wvx = 0f, wvy = 0f, wvSum = 0f;
-    for (int i = 0; i < vLen; i++)
-    {
-        float w = i + 1f;
-        wvx += vx[i] * w;
-        wvy += vy[i] * w;
-        wvSum += w;
-    }
-    wvx /= wvSum;
-    wvy /= wvSum;
-
-    // Derivative tower: up to 5 orders of velocity vector derivatives
-    // velDx[k], velDy[k] = weighted average of (k+1)-th derivative of position
-    var velDx = new float[5];
-    var velDy = new float[5];
-
-    float[] strengths = { D1Strength, D2Strength, D3Strength, D4Strength, D5Strength };
-
-    var curX = vx;
-    var curY = vy;
-    int curLen = vLen;
-
-    for (int order = 0; order < 5; order++)
-    {
-        int nextLen = curLen - 1;
-        if (nextLen <= 0) break;
-
-        var nextX = new float[nextLen];
-        var nextY = new float[nextLen];
-        for (int i = 0; i < nextLen; i++)
+        private (float dx, float dy) PredictDelta(double elapsedMs)
         {
-            nextX[i] = (curX[i + 1] - curX[i]) * invdt;
-            nextY[i] = (curY[i + 1] - curY[i]) * invdt;
-        }
-
-        float wx = 0f, wy = 0f, ws = 0f;
-        for (int i = 0; i < nextLen; i++)
+        bool dirty;
+        lock (_historyLock)
         {
-            float w = (i + 1f)*(i + 1f);
-            wx += nextX[i] * w;
-            wy += nextY[i] * w;
-            ws += w;
+            dirty = _historyDirty;
+            if (dirty)
+            {
+                _historySnapshot.Clear();
+                _historySnapshot.AddRange(_history);
+                _historyDirty = false;
+            }
         }
-        if (ws > 0f)
+
+        if (dirty)
         {
-            velDx[order] = strengths[order] * wx / ws;
-            velDy[order] = strengths[order] * wy / ws;
+            RebuildCache();
         }
 
-        curX = nextX;
-        curY = nextY;
-        curLen = nextLen;
-    }
-
-    // Normal acceleration (signed curvature × speed²) for turning
-    int naLen = n - 2;
-    var na = new float[naLen];
-    for (int i = 0; i < naLen; i++)
-    {
-        float ax = vx[i], ay = vy[i];
-        float bx = vx[i + 1], by = vy[i + 1];
-        float na_ = ax * by - ay * bx; // cross product = signed curvature × speed²
-        float speed = MathF.Sqrt(ax * ax + ay * ay);
-        na[i] = speed > 1e-6f ? na_ / speed : 0f; // normalise to angular velocity
-    }
-
-    float wna = 0f, wnaSum = 0f;
-    for (int i = 0; i < naLen; i++)
-    {
-        float w = (i + 1f)*(i + 1f);
-        wna += na[i] * w;
-        wnaSum += w;
-    }
-    float baseNA = wnaSum > 0f ? wna / wnaSum : 0f;
-
-    // Derivative tower for normal acceleration
-    var naDx = new float[5];
-    var curNa = na;
-    int curNaLen = naLen;
-
-    for (int order = 0; order < 5; order++)
-    {
-        int nextLen = curNaLen - 1;
-        if (nextLen <= 0) break;
-
-        var nextNa = new float[nextLen];
-        for (int i = 0; i < nextLen; i++)
-            nextNa[i] = (curNa[i + 1] - curNa[i]) * invdt;
-
-        float wn = 0f, ws = 0f;
-        for (int i = 0; i < nextLen; i++)
-        {
-            float w = (i + 1f)*(i + 1f);
-            wn += nextNa[i] * w;
-            ws += w;
-        }
-        if (ws > 0f)
-            naDx[order] = strengths[order] * wn / ws;
-
-        curNa = nextNa;
-        curNaLen = nextLen;
-    }
-
-    float naScale = Math.Clamp((float)(LookAheadMs / 50.0), 0f, 1f);
-    baseNA *= naScale;
-    for (int i = 0; i < 5; i++) naDx[i] *= naScale;
-
+    
     // Integrate predicted path
     double totalT = (LookAheadMs + elapsedMs) / 1000.0;
     float dt = (float)totalT / integrationsteps;
     float dx = 0f, dy = 0f;
-    float cvx = wvx, cvy = wvy;
+    float cvx = _wvx, cvy = _wvy;
 
     for (int step = 0; step < integrationsteps; step++)
     {
@@ -339,21 +421,21 @@ namespace FrenetSerretFramePredictor
         {
             factorial *= (order + 1);
             float tPow = MathF.Pow(stepT, order + 1);
-            dvx += velDx[order] * tPow / factorial;
-            dvy += velDy[order] * tPow / factorial;
+            dvx += _velDx[order] * tPow / factorial;
+            dvy += _velDy[order] * tPow / factorial;
         }
 
         float rvx = cvx + dvx;
         float rvy = cvy + dvy;
 
         // Taylor expansion of normal acceleration at this step
-        float normalAcc = baseNA;
+        float normalAcc = _baseNA;
         factorial = 1f;
         for (int order = 0; order < 5; order++)
         {
             factorial *= (order + 1);
             float tPow = MathF.Pow(stepT, order + 1);
-            normalAcc += naDx[order] * tPow / factorial;
+            normalAcc += _naDx[order] * tPow / factorial;
         }
 
         // Rotate velocity by angular velocity
@@ -370,8 +452,8 @@ namespace FrenetSerretFramePredictor
         dy += ry * dt;
 
         // Advance base velocity by first derivative
-        cvx += velDx[0] * dt;
-        cvy += velDy[0] * dt;
+        cvx += _velDx[0] * dt;
+        cvy += _velDy[0] * dt;
     }
 
     return (dx, dy);
